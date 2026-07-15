@@ -8,6 +8,7 @@ file sharing across devices.
 import asyncio
 import base64
 import io
+import json
 import mimetypes
 import os
 import secrets
@@ -53,6 +54,7 @@ ENCRYPTION_KEY = Fernet.generate_key()
 CIPHER = Fernet(ENCRYPTION_KEY)
 CLEANUP_INTERVAL = 30  # seconds between cleanup sweeps
 SESSION_ID_LENGTH = 6
+SESSION_META_FILE = "session.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # In-memory session store
@@ -65,6 +67,7 @@ sessions: dict = {}
 # ──────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    _load_persisted_sessions()
     task = asyncio.create_task(_cleanup_expired_sessions())
     yield
     task.cancel()
@@ -82,6 +85,60 @@ def _generate_session_id() -> str:
         sid = "".join(secrets.choice(alphabet) for _ in range(SESSION_ID_LENGTH))
         if sid not in sessions:
             return sid
+
+
+def _session_dir(session_id: str) -> Path:
+    return UPLOAD_DIR / session_id
+
+
+def _session_meta_path(session_id: str) -> Path:
+    return _session_dir(session_id) / SESSION_META_FILE
+
+
+def _delete_session(session_id: str) -> None:
+    shutil.rmtree(_session_dir(session_id), ignore_errors=True)
+    sessions.pop(session_id, None)
+
+
+def _persist_session(session_id: str) -> None:
+    session = sessions.get(session_id)
+    if not session:
+        return
+    meta_path = _session_meta_path(session_id)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_persisted_sessions() -> None:
+    if not UPLOAD_DIR.exists():
+        return
+
+    now = time.time()
+    for meta_path in UPLOAD_DIR.glob(f"*/{SESSION_META_FILE}"):
+        try:
+            session = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            shutil.rmtree(meta_path.parent, ignore_errors=True)
+            continue
+
+        session_id = str(session.get("id", "")).upper().strip()
+        expires_at = float(session.get("expires_at", 0))
+        if not session_id or now > expires_at:
+            shutil.rmtree(meta_path.parent, ignore_errors=True)
+            continue
+
+        session["id"] = session_id
+        sessions[session_id] = session
+
+
+def _public_session_url(request: Request, session_id: str) -> str:
+    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
+    return f"{base}/session/{session_id}"
+
+
+def _public_send_to_url(request: Request, session_id: str) -> str:
+    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
+    return f"{base}/send-to/{session_id}"
 
 
 def _format_size(size_bytes: int) -> str:
@@ -125,10 +182,7 @@ async def _cleanup_expired_sessions():
         now = time.time()
         expired = [sid for sid, s in sessions.items() if now > s["expires_at"]]
         for sid in expired:
-            session_dir = UPLOAD_DIR / sid
-            if session_dir.exists():
-                shutil.rmtree(session_dir, ignore_errors=True)
-            sessions.pop(sid, None)
+            _delete_session(sid)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -152,12 +206,12 @@ async def api_upload(
             raise HTTPException(404, "Session not found or expired.")
         if time.time() > sessions[sid]["expires_at"]:
             raise HTTPException(410, "Session has expired.")
-        session_dir = UPLOAD_DIR / sid
+        session_dir = _session_dir(sid)
         session_dir.mkdir(parents=True, exist_ok=True)
         existing = True
     else:
         sid = _generate_session_id()
-        session_dir = UPLOAD_DIR / sid
+        session_dir = _session_dir(sid)
         session_dir.mkdir(parents=True, exist_ok=True)
 
     file_list = []
@@ -232,12 +286,12 @@ async def api_upload(
             "download_count": 0,
         }
 
-    base = str(request.base_url).rstrip("/")
+        _persist_session(sid)
     return JSONResponse({
         "session_id": sid,
         "expires_at": sessions[sid]["expires_at"],
         "file_count": len(file_list),
-        "share_url": f"{base}/session/{sid}",
+          "share_url": _public_session_url(request, sid),
     })
 
 
@@ -261,6 +315,11 @@ async def api_session_info(session_id: str):
         "total_size_formatted": s["total_size_formatted"],
         "download_count": s["download_count"],
     })
+
+
+    @app.get("/healthz")
+    async def healthz():
+      return JSONResponse({"ok": True, "service": APP_NAME, "version": APP_VERSION})
 
 
 @app.get("/api/download/{session_id}/{filename}")
@@ -366,12 +425,11 @@ async def api_qr_code(request: Request, session_id: str):
     sid = session_id.upper().strip()
     if sid not in sessions:
         raise HTTPException(404, "Session not found or expired.")
-    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
-    url = f"{base}/session/{sid}"
+    url = _public_session_url(request, sid)
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="#0c1220", back_color="#f4efe4")
+    img = qr.make_image(fill_color="#9b7bff", back_color="#f6f2ff")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -381,7 +439,7 @@ async def api_qr_code(request: Request, session_id: str):
 @app.post("/api/receive-session")
 async def api_create_receive_session():
     sid = _generate_session_id()
-    session_dir = UPLOAD_DIR / sid
+    session_dir = _session_dir(sid)
     session_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
     sessions[sid] = {
@@ -396,24 +454,24 @@ async def api_create_receive_session():
         "download_count": 0,
         "waiting": True,
     }
+    _persist_session(sid)
     return JSONResponse({"session_id": sid})
 
 
 @app.get("/api/receive-qr/{session_id}")
 async def api_receive_qr(request: Request, session_id: str):
-    sid = session_id.upper().strip()
-    if sid not in sessions:
-        raise HTTPException(404, "Session not found.")
-    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
-    url = f"{base}/send-to/{sid}"
-    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
-    qr.add_data(url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#0c1220", back_color="#f4efe4")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png")
+  sid = session_id.upper().strip()
+  if sid not in sessions:
+    raise HTTPException(404, "Session not found.")
+  url = _public_send_to_url(request, sid)
+  qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
+  qr.add_data(url)
+  qr.make(fit=True)
+  img = qr.make_image(fill_color="#9b7bff", back_color="#f6f2ff")
+  buf = io.BytesIO()
+  img.save(buf, format="PNG")
+  buf.seek(0)
+  return StreamingResponse(buf, media_type="image/png")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -428,22 +486,22 @@ _SHARED_STYLES = """
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg-primary: #0b1020;
-    --bg-secondary: rgba(18, 24, 43, 0.78);
-    --bg-surface: rgba(15, 20, 37, 0.72);
-    --bg-surface-hover: rgba(22, 29, 52, 0.82);
-    --bg-elevated: rgba(9, 13, 25, 0.94);
+    --bg-primary: #05040b;
+    --bg-secondary: rgba(21, 15, 34, 0.82);
+    --bg-surface: rgba(18, 12, 31, 0.74);
+    --bg-surface-hover: rgba(31, 20, 51, 0.84);
+    --bg-elevated: rgba(8, 6, 14, 0.96);
     --border-color: rgba(224, 232, 255, 0.12);
     --border-light: rgba(255, 255, 255, 0.22);
     --text-primary: #f6f2ea;
     --text-secondary: #d8dfef;
     --text-muted: #9aa6be;
     --text-bright: #ffffff;
-    --accent: #7ce0ff;
-    --accent-hover: #a7ecff;
-    --accent-subtle: rgba(124, 224, 255, 0.12);
-    --accent-warm: #ffd59a;
-    --accent-warm-subtle: rgba(255, 213, 154, 0.12);
+    --accent: #9b7bff;
+    --accent-hover: #c3b2ff;
+    --accent-subtle: rgba(155, 123, 255, 0.14);
+    --accent-warm: #ff78d2;
+    --accent-warm-subtle: rgba(255, 120, 210, 0.12);
     --success: #8df0c4;
     --success-subtle: rgba(141, 240, 196, 0.12);
     --warning: #ffd479;
@@ -465,10 +523,10 @@ _SHARED_STYLES = """
   body {
     font-family: var(--font);
     background:
-      radial-gradient(circle at top left, rgba(124, 224, 255, 0.16), transparent 28%),
-      radial-gradient(circle at top right, rgba(255, 213, 154, 0.12), transparent 24%),
-      radial-gradient(circle at bottom, rgba(100, 120, 255, 0.12), transparent 30%),
-      linear-gradient(180deg, #060915 0%, #0b1020 48%, #090d18 100%);
+      radial-gradient(circle at top left, rgba(155, 123, 255, 0.22), transparent 28%),
+      radial-gradient(circle at top right, rgba(255, 120, 210, 0.14), transparent 24%),
+      radial-gradient(circle at bottom, rgba(72, 48, 146, 0.18), transparent 30%),
+      linear-gradient(180deg, #020205 0%, #07050d 48%, #0b0713 100%);
     color: var(--text-primary);
     line-height: 1.6;
     min-height: 100vh;
@@ -498,7 +556,7 @@ _SHARED_STYLES = """
     height: 30vw;
     min-width: 280px;
     min-height: 280px;
-    background: radial-gradient(circle, rgba(124, 224, 255, 0.18), transparent 70%);
+    background: radial-gradient(circle, rgba(155, 123, 255, 0.22), transparent 70%);
     filter: blur(10px);
     pointer-events: none;
     z-index: -2;
@@ -532,7 +590,7 @@ _SHARED_STYLES = """
     content: '';
     width: 10px; height: 10px; border-radius: 50%;
     background: linear-gradient(135deg, var(--accent), var(--accent-warm));
-    box-shadow: 0 0 18px rgba(124, 224, 255, 0.55);
+    box-shadow: 0 0 18px rgba(155, 123, 255, 0.55);
   }
 
   .btn {
@@ -545,13 +603,13 @@ _SHARED_STYLES = """
   }
   .btn-primary {
     color: #06101a;
-    background: linear-gradient(135deg, #d9f8ff 0%, #89dbff 42%, #ffd59a 100%);
-    box-shadow: 0 18px 40px rgba(124, 224, 255, 0.24);
+    background: linear-gradient(135deg, #f3ecff 0%, #bda9ff 45%, #ff8bd6 100%);
+    box-shadow: 0 18px 40px rgba(155, 123, 255, 0.24);
   }
   .btn-primary:hover {
     transform: translateY(-1px);
     filter: brightness(1.03);
-    box-shadow: 0 22px 50px rgba(124, 224, 255, 0.28);
+    box-shadow: 0 22px 50px rgba(155, 123, 255, 0.28);
   }
   .btn-outline {
     background: rgba(255, 255, 255, 0.02); color: var(--text-primary);
@@ -559,8 +617,8 @@ _SHARED_STYLES = """
     backdrop-filter: blur(10px);
   }
   .btn-outline:hover {
-    border-color: rgba(124, 224, 255, 0.36); color: var(--text-bright);
-    background: rgba(124, 224, 255, 0.08);
+    border-color: rgba(155, 123, 255, 0.36); color: var(--text-bright);
+    background: rgba(155, 123, 255, 0.08);
   }
   .btn-ghost {
     background: rgba(255, 255, 255, 0.03); color: var(--text-primary);
@@ -607,8 +665,8 @@ _SHARED_STYLES = """
     transition: all var(--transition); outline: none;
   }
   .input-field:focus {
-    border-color: rgba(124, 224, 255, 0.35);
-    box-shadow: 0 0 0 4px rgba(124, 224, 255, 0.08);
+    border-color: rgba(155, 123, 255, 0.35);
+    box-shadow: 0 0 0 4px rgba(155, 123, 255, 0.08);
   }
   .input-field::placeholder { color: var(--text-muted); }
 
