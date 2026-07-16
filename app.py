@@ -8,7 +8,6 @@ file sharing across devices.
 import asyncio
 import base64
 import io
-import json
 import mimetypes
 import os
 import secrets
@@ -36,25 +35,25 @@ from fastapi.responses import (
     JSONResponse,
     Response,
     StreamingResponse,
+    FileResponse,
 )
 
 # ──────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────
-APP_NAME = "filecp"
+APP_NAME = "FileCP: Self File Sharing Application"
 APP_VERSION = "1.0.0"
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB total per session
-MAX_SINGLE_FILE = 200 * 1024 * 1024  # 200 MB per file
+MAX_UPLOAD_SIZE = 2000 * 1024 * 1024  # 2 GB total per session
+MAX_SINGLE_FILE = 1000 * 1024 * 1024  # 1 GB per file
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "filecp_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ENCRYPTION_KEY = Fernet.generate_key()
 CIPHER = Fernet(ENCRYPTION_KEY)
-CLEANUP_INTERVAL = 30  # seconds between cleanup sweeps
+CLEANUP_INTERVAL = 15  # seconds between cleanup sweeps
 SESSION_ID_LENGTH = 6
-SESSION_META_FILE = "session.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # In-memory session store
@@ -67,7 +66,6 @@ sessions: dict = {}
 # ──────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    _load_persisted_sessions()
     task = asyncio.create_task(_cleanup_expired_sessions())
     yield
     task.cancel()
@@ -85,60 +83,6 @@ def _generate_session_id() -> str:
         sid = "".join(secrets.choice(alphabet) for _ in range(SESSION_ID_LENGTH))
         if sid not in sessions:
             return sid
-
-
-def _session_dir(session_id: str) -> Path:
-    return UPLOAD_DIR / session_id
-
-
-def _session_meta_path(session_id: str) -> Path:
-    return _session_dir(session_id) / SESSION_META_FILE
-
-
-def _delete_session(session_id: str) -> None:
-    shutil.rmtree(_session_dir(session_id), ignore_errors=True)
-    sessions.pop(session_id, None)
-
-
-def _persist_session(session_id: str) -> None:
-    session = sessions.get(session_id)
-    if not session:
-        return
-    meta_path = _session_meta_path(session_id)
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _load_persisted_sessions() -> None:
-    if not UPLOAD_DIR.exists():
-        return
-
-    now = time.time()
-    for meta_path in UPLOAD_DIR.glob(f"*/{SESSION_META_FILE}"):
-        try:
-            session = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            shutil.rmtree(meta_path.parent, ignore_errors=True)
-            continue
-
-        session_id = str(session.get("id", "")).upper().strip()
-        expires_at = float(session.get("expires_at", 0))
-        if not session_id or now > expires_at:
-            shutil.rmtree(meta_path.parent, ignore_errors=True)
-            continue
-
-        session["id"] = session_id
-        sessions[session_id] = session
-
-
-def _public_session_url(request: Request, session_id: str) -> str:
-    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
-    return f"{base}/session/{session_id}"
-
-
-def _public_send_to_url(request: Request, session_id: str) -> str:
-    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
-    return f"{base}/send-to/{session_id}"
 
 
 def _format_size(size_bytes: int) -> str:
@@ -182,12 +126,31 @@ async def _cleanup_expired_sessions():
         now = time.time()
         expired = [sid for sid, s in sessions.items() if now > s["expires_at"]]
         for sid in expired:
-            _delete_session(sid)
+            session_dir = UPLOAD_DIR / sid
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+            sessions.pop(sid, None)
 
 
 # ──────────────────────────────────────────────────────────────────────
 # API Endpoints
 # ──────────────────────────────────────────────────────────────────────
+@app.get("/logo.png")
+async def get_logo():
+    if os.path.exists("logo.png"):
+        return FileResponse("logo.png")
+    raise HTTPException(status_code=404, detail="Logo not found")
+
+@app.get("/favicon.ico")
+async def get_favicon():
+    if os.path.exists("logo.png"):
+        return FileResponse("logo.png")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
+@app.get("/healthz")
+async def health_check():
+    return JSONResponse({"status": "ok"})
+
 @app.post("/api/upload")
 async def api_upload(
     request: Request,
@@ -206,12 +169,12 @@ async def api_upload(
             raise HTTPException(404, "Session not found or expired.")
         if time.time() > sessions[sid]["expires_at"]:
             raise HTTPException(410, "Session has expired.")
-        session_dir = _session_dir(sid)
+        session_dir = UPLOAD_DIR / sid
         session_dir.mkdir(parents=True, exist_ok=True)
         existing = True
     else:
         sid = _generate_session_id()
-        session_dir = _session_dir(sid)
+        session_dir = UPLOAD_DIR / sid
         session_dir.mkdir(parents=True, exist_ok=True)
 
     file_list = []
@@ -228,12 +191,12 @@ async def api_upload(
 
         if file_size > MAX_SINGLE_FILE:
             shutil.rmtree(session_dir, ignore_errors=True)
-            raise HTTPException(400, f"File '{safe_name}' exceeds 200 MB limit.")
+            raise HTTPException(400, f"File '{safe_name}' exceeds 1 GB limit.")
 
         total_size += file_size
         if total_size > MAX_UPLOAD_SIZE:
             shutil.rmtree(session_dir, ignore_errors=True)
-            raise HTTPException(400, "Total upload size exceeds 500 MB limit.")
+            raise HTTPException(400, "Total upload size exceeds 2 GB limit.")
 
         encrypted = CIPHER.encrypt(content)
         file_path = session_dir / safe_name
@@ -286,12 +249,12 @@ async def api_upload(
             "download_count": 0,
         }
 
-        _persist_session(sid)
+    base = str(request.base_url).rstrip("/")
     return JSONResponse({
         "session_id": sid,
         "expires_at": sessions[sid]["expires_at"],
         "file_count": len(file_list),
-          "share_url": _public_session_url(request, sid),
+        "share_url": f"{base}/session/{sid}",
     })
 
 
@@ -315,11 +278,6 @@ async def api_session_info(session_id: str):
         "total_size_formatted": s["total_size_formatted"],
         "download_count": s["download_count"],
     })
-
-
-    @app.get("/healthz")
-    async def healthz():
-      return JSONResponse({"ok": True, "service": APP_NAME, "version": APP_VERSION})
 
 
 @app.get("/api/download/{session_id}/{filename}")
@@ -425,11 +383,12 @@ async def api_qr_code(request: Request, session_id: str):
     sid = session_id.upper().strip()
     if sid not in sessions:
         raise HTTPException(404, "Session not found or expired.")
-    url = _public_session_url(request, sid)
+    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
+    url = f"{base}/session/{sid}"
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="#9b7bff", back_color="#f6f2ff")
+    img = qr.make_image(fill_color="#0c1220", back_color="#f4efe4")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -439,7 +398,7 @@ async def api_qr_code(request: Request, session_id: str):
 @app.post("/api/receive-session")
 async def api_create_receive_session():
     sid = _generate_session_id()
-    session_dir = _session_dir(sid)
+    session_dir = UPLOAD_DIR / sid
     session_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
     sessions[sid] = {
@@ -454,24 +413,24 @@ async def api_create_receive_session():
         "download_count": 0,
         "waiting": True,
     }
-    _persist_session(sid)
     return JSONResponse({"session_id": sid})
 
 
 @app.get("/api/receive-qr/{session_id}")
 async def api_receive_qr(request: Request, session_id: str):
-  sid = session_id.upper().strip()
-  if sid not in sessions:
-    raise HTTPException(404, "Session not found.")
-  url = _public_send_to_url(request, sid)
-  qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
-  qr.add_data(url)
-  qr.make(fit=True)
-  img = qr.make_image(fill_color="#9b7bff", back_color="#f6f2ff")
-  buf = io.BytesIO()
-  img.save(buf, format="PNG")
-  buf.seek(0)
-  return StreamingResponse(buf, media_type="image/png")
+    sid = session_id.upper().strip()
+    if sid not in sessions:
+        raise HTTPException(404, "Session not found.")
+    base = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
+    url = f"{base}/send-to/{sid}"
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#0c1220", back_color="#f4efe4")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -480,53 +439,55 @@ async def api_receive_qr(request: Request, session_id: str):
 
 _SHARED_STYLES = """
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
   @import url('https://fonts.googleapis.com/icon?family=Material+Icons+Round');
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg-primary: #05040b;
-    --bg-secondary: rgba(21, 15, 34, 0.82);
-    --bg-surface: rgba(18, 12, 31, 0.74);
-    --bg-surface-hover: rgba(31, 20, 51, 0.84);
-    --bg-elevated: rgba(8, 6, 14, 0.96);
-    --border-color: rgba(224, 232, 255, 0.12);
-    --border-light: rgba(255, 255, 255, 0.22);
-    --text-primary: #f6f2ea;
-    --text-secondary: #d8dfef;
-    --text-muted: #9aa6be;
+    --bg-primary: #050505;
+    --bg-secondary: rgba(20, 20, 20, 0.78);
+    --bg-surface: rgba(26, 26, 26, 0.72);
+    --bg-surface-hover: rgba(35, 35, 35, 0.82);
+    --bg-elevated: rgba(18, 18, 18, 0.94);
+    --border-color: rgba(255, 255, 255, 0.08);
+    --border-light: rgba(255, 255, 255, 0.15);
+    --text-primary: #f0f0f0;
+    --text-secondary: #a0a0a0;
+    --text-muted: #707070;
     --text-bright: #ffffff;
-    --accent: #9b7bff;
-    --accent-hover: #c3b2ff;
-    --accent-subtle: rgba(155, 123, 255, 0.14);
-    --accent-warm: #ff78d2;
-    --accent-warm-subtle: rgba(255, 120, 210, 0.12);
-    --success: #8df0c4;
-    --success-subtle: rgba(141, 240, 196, 0.12);
-    --warning: #ffd479;
-    --warning-subtle: rgba(255, 212, 121, 0.12);
-    --error: #ff8e8e;
-    --error-subtle: rgba(255, 142, 142, 0.12);
-    --radius-sm: 10px;
-    --radius-md: 16px;
-    --radius-lg: 24px;
-    --shadow-sm: 0 10px 24px rgba(0, 0, 0, 0.16);
-    --shadow-md: 0 18px 44px rgba(0, 0, 0, 0.24);
-    --shadow-lg: 0 30px 70px rgba(0, 0, 0, 0.34);
-    --transition: 0.22s cubic-bezier(0.4, 0, 0.2, 1);
-    --font: 'Manrope', sans-serif;
-    --display-font: 'Fraunces', serif;
+    
+    --accent: #00e5ff;
+    --accent-hover: #69f0ae;
+    --accent-subtle: rgba(0, 229, 255, 0.12);
+    --accent-warm: #ff007a;
+    --accent-warm-subtle: rgba(255, 0, 122, 0.12);
+    
+    --success: #69f0ae;
+    --success-subtle: rgba(105, 240, 174, 0.12);
+    --warning: #ffd740;
+    --warning-subtle: rgba(255, 215, 64, 0.12);
+    --error: #ff5252;
+    --error-subtle: rgba(255, 82, 82, 0.12);
+    
+    --radius-sm: 12px;
+    --radius-md: 20px;
+    --radius-lg: 32px;
+    --shadow-sm: 0 8px 32px rgba(0, 0, 0, 0.2);
+    --shadow-md: 0 16px 48px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.4);
+    --transition: 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+    --font: 'Inter', sans-serif;
+    --display-font: 'Outfit', sans-serif;
   }
 
   html { scroll-behavior: smooth; }
   body {
     font-family: var(--font);
-    background:
-      radial-gradient(circle at top left, rgba(155, 123, 255, 0.22), transparent 28%),
-      radial-gradient(circle at top right, rgba(255, 120, 210, 0.14), transparent 24%),
-      radial-gradient(circle at bottom, rgba(72, 48, 146, 0.18), transparent 30%),
-      linear-gradient(180deg, #020205 0%, #07050d 48%, #0b0713 100%);
+    background-color: var(--bg-primary);
+    background-image: 
+      radial-gradient(circle at 15% 50%, rgba(0, 229, 255, 0.08), transparent 40%),
+      radial-gradient(circle at 85% 30%, rgba(255, 0, 122, 0.08), transparent 40%);
     color: var(--text-primary);
     line-height: 1.6;
     min-height: 100vh;
@@ -539,27 +500,17 @@ _SHARED_STYLES = """
     position: fixed;
     inset: 0;
     pointer-events: none;
-    background-image:
-      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-    background-size: 34px 34px;
-    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.82), transparent 85%);
-    opacity: 0.32;
+    background-image: url('data:image/svg+xml,%3Csvg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"%3E%3Cfilter id="noiseFilter"%3E%3CfeTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="3" stitchTiles="stitch"/%3E%3C/filter%3E%3Crect width="100%25" height="100%25" filter="url(%23noiseFilter)" opacity="0.04"/%3E%3C/svg%3E');
     z-index: -2;
   }
   body::after {
     content: '';
     position: fixed;
-    right: -12vw;
-    top: 9vh;
-    width: 30vw;
-    height: 30vw;
-    min-width: 280px;
-    min-height: 280px;
-    background: radial-gradient(circle, rgba(155, 123, 255, 0.22), transparent 70%);
-    filter: blur(10px);
+    inset: 0;
+    background: linear-gradient(180deg, transparent 0%, var(--bg-primary) 100%);
     pointer-events: none;
-    z-index: -2;
+    z-index: -1;
+    opacity: 0.5;
   }
 
   a { color: var(--text-primary); text-decoration: none; transition: color var(--transition), opacity var(--transition); }
@@ -567,163 +518,170 @@ _SHARED_STYLES = """
 
   .material-icons-round { font-family: 'Material Icons Round'; vertical-align: middle; }
 
-  .container { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
   .text-center { text-align: center; }
 
   .nav {
     position: sticky; top: 0; z-index: 100;
-    background: rgba(7, 10, 19, 0.66);
-    backdrop-filter: blur(22px) saturate(160%);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 14px 0;
+    background: rgba(5, 5, 5, 0.6);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border-bottom: 1px solid var(--border-color);
+    padding: 16px 0;
   }
   .nav-inner {
     display: flex; align-items: center; justify-content: center;
-    max-width: 1120px; margin: 0 auto; padding: 0 24px;
+    max-width: 1200px; margin: 0 auto; padding: 0 32px;
   }
   .nav-brand {
-    display: inline-flex; align-items: center; gap: 10px;
-    font-family: var(--display-font); font-size: 1rem; font-weight: 700;
-    color: var(--text-primary); letter-spacing: 0.18em; text-transform: uppercase;
+    display: inline-flex; align-items: center; gap: 12px;
+    font-family: var(--display-font); font-size: 1.2rem; font-weight: 800;
+    color: var(--text-bright); letter-spacing: 0.1em;
   }
   .nav-brand::before {
     content: '';
-    width: 10px; height: 10px; border-radius: 50%;
+    width: 12px; height: 12px; border-radius: 50%;
     background: linear-gradient(135deg, var(--accent), var(--accent-warm));
-    box-shadow: 0 0 18px rgba(155, 123, 255, 0.55);
+    box-shadow: 0 0 20px var(--accent);
   }
 
   .btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    padding: 12px 22px; border-radius: 999px;
-    font-family: var(--font); font-size: 0.9rem; font-weight: 700;
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    padding: 14px 28px; border-radius: 999px;
+    font-family: var(--font); font-size: 0.95rem; font-weight: 600;
     cursor: pointer; border: 1px solid transparent; transition: all var(--transition);
-    text-decoration: none; white-space: nowrap; letter-spacing: 0.02em;
-    box-shadow: none;
+    text-decoration: none; white-space: nowrap;
+    box-shadow: none; position: relative; overflow: hidden;
   }
   .btn-primary {
-    color: #06101a;
-    background: linear-gradient(135deg, #f3ecff 0%, #bda9ff 45%, #ff8bd6 100%);
-    box-shadow: 0 18px 40px rgba(155, 123, 255, 0.24);
+    color: #000;
+    background: linear-gradient(135deg, var(--accent) 0%, #69f0ae 100%);
+    box-shadow: 0 12px 24px rgba(0, 229, 255, 0.2);
   }
   .btn-primary:hover {
-    transform: translateY(-1px);
-    filter: brightness(1.03);
-    box-shadow: 0 22px 50px rgba(155, 123, 255, 0.28);
+    transform: translateY(-2px);
+    box-shadow: 0 16px 32px rgba(0, 229, 255, 0.3);
+    filter: brightness(1.1);
   }
   .btn-outline {
-    background: rgba(255, 255, 255, 0.02); color: var(--text-primary);
-    border-color: rgba(255, 255, 255, 0.15);
-    backdrop-filter: blur(10px);
+    background: rgba(255, 255, 255, 0.03); color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(12px);
   }
   .btn-outline:hover {
-    border-color: rgba(155, 123, 255, 0.36); color: var(--text-bright);
-    background: rgba(155, 123, 255, 0.08);
+    border-color: var(--accent); color: var(--text-bright);
+    background: rgba(0, 229, 255, 0.05);
+    box-shadow: 0 8px 24px rgba(0, 229, 255, 0.1);
   }
   .btn-ghost {
-    background: rgba(255, 255, 255, 0.03); color: var(--text-primary);
-    border-color: rgba(255, 255, 255, 0.08);
+    background: transparent; color: var(--text-primary);
+    border-color: transparent;
   }
-  .btn-ghost:hover { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.14); }
-  .btn-sm { padding: 8px 14px; font-size: 0.78rem; }
-  .btn-lg { padding: 16px 34px; font-size: 0.95rem; letter-spacing: 0.04em; }
-  .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none !important; box-shadow: none; }
-  .btn .material-icons-round { font-size: 18px; }
+  .btn-ghost:hover { background: rgba(255, 255, 255, 0.05); }
+  .btn-sm { padding: 10px 18px; font-size: 0.85rem; }
+  .btn-lg { padding: 18px 40px; font-size: 1.05rem; letter-spacing: 0.02em; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
+  .btn .material-icons-round { font-size: 20px; }
 
   .card {
-    background: linear-gradient(180deg, rgba(19, 25, 43, 0.82), rgba(11, 16, 32, 0.78));
+    background: rgba(20, 20, 20, 0.6);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-lg);
-    padding: 24px;
+    padding: 32px;
     box-shadow: var(--shadow-md);
-    backdrop-filter: blur(18px) saturate(140%);
-    transition: transform var(--transition), border-color var(--transition), background var(--transition);
+    backdrop-filter: blur(20px) saturate(150%);
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+    transition: transform var(--transition), border-color var(--transition), box-shadow var(--transition);
   }
   .card-hover:hover {
-    border-color: rgba(255, 255, 255, 0.18);
-    transform: translateY(-2px);
+    border-color: rgba(255, 255, 255, 0.2);
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-lg);
   }
 
   .chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 6px 12px; border-radius: 999px;
-    font-size: 0.72rem; font-weight: 700;
-    background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08);
-    color: var(--text-secondary);
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 16px; border-radius: 999px;
+    font-size: 0.8rem; font-weight: 600;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
   }
-  .chip .material-icons-round { font-size: 13px; }
+  .chip .material-icons-round { font-size: 14px; color: var(--accent); }
 
-  .input-group { display: flex; flex-direction: column; gap: 6px; }
+  .input-group { display: flex; flex-direction: column; gap: 8px; }
   .input-group label {
-    font-size: 0.7rem; font-weight: 700; color: var(--text-muted);
-    text-transform: uppercase; letter-spacing: 1.4px;
+    font-size: 0.75rem; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.1em;
   }
   .input-field {
-    padding: 12px 16px; border-radius: var(--radius-sm);
-    background: rgba(10, 14, 27, 0.7); border: 1px solid rgba(255, 255, 255, 0.1);
-    color: var(--text-primary); font-family: var(--font); font-size: 0.92rem;
+    padding: 16px 20px; border-radius: var(--radius-md);
+    background: rgba(10, 10, 10, 0.8); border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-primary); font-family: var(--font); font-size: 1rem;
     transition: all var(--transition); outline: none;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
   }
   .input-field:focus {
-    border-color: rgba(155, 123, 255, 0.35);
-    box-shadow: 0 0 0 4px rgba(155, 123, 255, 0.08);
+    border-color: var(--accent);
+    background: rgba(15, 15, 15, 0.9);
+    box-shadow: 0 0 0 4px rgba(0, 229, 255, 0.1), inset 0 2px 4px rgba(0,0,0,0.2);
   }
   .input-field::placeholder { color: var(--text-muted); }
 
   .progress-bar {
-    width: 100%; height: 4px; border-radius: 999px;
-    background: rgba(255, 255, 255, 0.08); overflow: hidden;
+    width: 100%; height: 6px; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.05); overflow: hidden;
   }
   .progress-bar-fill {
     height: 100%; border-radius: 999px;
     background: linear-gradient(90deg, var(--accent), var(--accent-warm));
-    transition: width 0.3s ease;
+    transition: width 0.4s cubic-bezier(0.25, 1, 0.5, 1);
   }
 
   @keyframes fadeInUp {
-    from { opacity: 0; transform: translateY(16px); }
+    from { opacity: 0; transform: translateY(20px); }
     to { opacity: 1; transform: translateY(0); }
   }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .animate-in { animation: fadeInUp 0.55s ease forwards; }
-  .stagger-1 { animation-delay: 0.05s; opacity: 0; }
-  .stagger-2 { animation-delay: 0.1s; opacity: 0; }
-  .stagger-3 { animation-delay: 0.15s; opacity: 0; }
-  .stagger-4 { animation-delay: 0.2s; opacity: 0; }
+  .animate-in { animation: fadeInUp 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards; }
+  .stagger-1 { animation-delay: 0.1s; opacity: 0; }
+  .stagger-2 { animation-delay: 0.2s; opacity: 0; }
+  .stagger-3 { animation-delay: 0.3s; opacity: 0; }
+  .stagger-4 { animation-delay: 0.4s; opacity: 0; }
 
   .spinner {
-    width: 24px; height: 24px; border: 2px solid rgba(255, 255, 255, 0.12);
+    width: 24px; height: 24px; border: 3px solid rgba(255, 255, 255, 0.1);
     border-top-color: var(--accent); border-radius: 50%;
-    animation: spin 0.7s linear infinite;
+    animation: spin 0.8s cubic-bezier(0.5, 0, 0.5, 1) infinite;
   }
-  .spinner-lg { width: 36px; height: 36px; }
+  .spinner-lg { width: 40px; height: 40px; border-width: 4px; }
 
   .toast-container {
-    position: fixed; bottom: 24px; right: 24px; z-index: 9999;
-    display: flex; flex-direction: column; gap: 8px;
+    position: fixed; bottom: 32px; right: 32px; z-index: 9999;
+    display: flex; flex-direction: column; gap: 12px;
   }
   .toast {
-    display: flex; align-items: center; gap: 10px;
-    padding: 13px 16px; border-radius: 16px;
-    background: rgba(10, 13, 23, 0.92); border: 1px solid rgba(255, 255, 255, 0.12);
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 20px; border-radius: var(--radius-md);
+    background: rgba(20, 20, 20, 0.95); border: 1px solid rgba(255, 255, 255, 0.1);
     box-shadow: var(--shadow-lg); color: var(--text-primary);
-    font-size: 0.82rem; font-weight: 600;
-    animation: fadeInUp 0.3s ease forwards;
-    max-width: 340px;
+    font-size: 0.9rem; font-weight: 500;
+    backdrop-filter: blur(10px);
+    animation: fadeInUp 0.4s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+    max-width: 400px;
   }
-  .toast .material-icons-round { font-size: 18px; color: var(--accent); }
+  .toast .material-icons-round { font-size: 20px; color: var(--accent); }
 
   .hero-title, .receive-card h2, .page-header h1, .session-header h1, .success-card h2 {
     font-family: var(--display-font);
-    letter-spacing: 0.02em;
+    letter-spacing: -0.02em;
   }
 
-  @media (max-width: 640px) {
-    .container { padding: 0 16px; }
-    .card { padding: 18px; }
-    .btn-lg { padding: 14px 24px; font-size: 0.9rem; }
-    .toast-container { left: 16px; right: 16px; bottom: 16px; }
+  @media (max-width: 768px) {
+    .container { padding: 0 24px; }
+    .card { padding: 24px; }
+    .btn-lg { padding: 16px 32px; font-size: 1rem; }
+    .toast-container { left: 24px; right: 24px; bottom: 24px; }
     .toast { max-width: none; }
   }
 </style>
@@ -732,7 +690,10 @@ _SHARED_STYLES = """
 _NAV_INNER = """
 <nav class="nav">
   <div class="nav-inner">
-    <a href="/" class="nav-brand">filecp</a>
+    <a href="/" class="nav-brand">
+      <img src="/logo.png" alt="FileCP Logo" style="height: 32px; width: 32px; border-radius: 8px; object-fit: contain;">
+      FileCP
+    </a>
   </div>
 </nav>
 """
@@ -759,61 +720,69 @@ _WELCOME_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>filecp</title>
+  <title>FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
     .hero {
       min-height: 100vh;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      text-align: center; padding: 40px 24px;
+      text-align: center; padding: 60px 24px;
+      position: relative;
     }
     .hero-title {
-      font-size: clamp(3.5rem, 10vw, 6rem);
-      font-weight: 900; letter-spacing: 6px;
-      text-transform: uppercase;
-      line-height: 1; margin-bottom: 20px;
-      color: var(--text-primary);
+      font-size: clamp(3.5rem, 10vw, 7.5rem);
+      font-weight: 900; letter-spacing: -0.04em;
+      line-height: 1; margin-bottom: 24px;
+      color: var(--text-bright);
+      background: linear-gradient(135deg, #fff 0%, #a0a0a0 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
     .hero-subtitle {
-      font-size: clamp(0.85rem, 2vw, 1rem);
-      color: var(--text-muted); font-weight: 400;
-      max-width: 420px; line-height: 1.8; margin-bottom: 48px;
-      letter-spacing: 0.5px;
+      font-size: clamp(1.1rem, 3vw, 1.3rem);
+      color: var(--text-secondary); font-weight: 400;
+      max-width: 600px; line-height: 1.6; margin-bottom: 54px;
     }
     .features {
-      display: grid; grid-template-columns: repeat(3, 1fr);
-      gap: 14px; margin-top: 56px; width: 100%; max-width: 780px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 24px; margin-top: 80px; width: 100%; max-width: 960px;
     }
-    @media (max-width: 640px) { .features { grid-template-columns: 1fr; } }
     .feature-card {
-      display: flex; align-items: flex-start; gap: 12px;
-      padding: 16px; border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color);
+      display: flex; align-items: flex-start; gap: 20px;
+      padding: 28px; border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color);
       text-align: left; transition: all var(--transition);
+      backdrop-filter: blur(12px);
     }
-    .feature-card:hover { border-color: var(--border-light); }
+    .feature-card:hover { 
+      border-color: rgba(255, 255, 255, 0.15); 
+      background: rgba(255, 255, 255, 0.04);
+      transform: translateY(-6px);
+      box-shadow: var(--shadow-sm);
+    }
     .feature-icon {
-      width: 32px; height: 32px; border-radius: 6px;
-      background: var(--accent-subtle); color: var(--text-muted);
+      width: 52px; height: 52px; border-radius: 14px;
+      background: linear-gradient(135deg, rgba(0, 229, 255, 0.1), rgba(255, 0, 122, 0.1));
+      color: var(--accent); border: 1px solid rgba(0, 229, 255, 0.2);
       display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     }
-    .feature-icon .material-icons-round { font-size: 16px; }
-    .feature-card h3 { font-size: 0.78rem; font-weight: 700; color: var(--text-primary); margin-bottom: 2px; }
-    .feature-card p { font-size: 0.68rem; color: var(--text-muted); line-height: 1.5; }
+    .feature-icon .material-icons-round { font-size: 26px; }
+    .feature-card h3 { font-family: var(--display-font); font-size: 1.2rem; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; }
+    .feature-card p { font-size: 0.9rem; color: var(--text-muted); line-height: 1.6; }
 
     .footer {
-      text-align: center; padding: 24px;
-      color: var(--text-muted); font-size: 0.65rem;
-      letter-spacing: 1px;
+      position: absolute; bottom: 32px; width: 100%;
+      text-align: center; color: var(--text-muted); font-size: 0.85rem;
+      letter-spacing: 0.05em; opacity: 0.5;
     }
   </style>
 </head>
 <body>
   <main class="hero">
-    <h1 class="hero-title animate-in stagger-1">filecp</h1>
+    <h1 class="hero-title animate-in stagger-1">FileCP</h1>
     <p class="hero-subtitle animate-in stagger-2">
-      Instant, Private, and Seamless File Sharing.<br>
-      No accounts. No tracking. Just transfer.
+      Self File Sharing Application.<br>
+      Instant, Private, and Seamless.
     </p>
     <a href="/dashboard" class="btn btn-primary btn-lg animate-in stagger-3">
       Get Started
@@ -821,7 +790,7 @@ _WELCOME_PAGE = """<!DOCTYPE html>
     <div class="features animate-in stagger-4">
       <div class="feature-card">
         <div class="feature-icon"><span class="material-icons-round">qr_code_2</span></div>
-        <div><h3>QR Pairing</h3><p>Scan to instantly access files on any device</p></div>
+        <div><h3>QR Sharing</h3><p>Scan to instantly access files on any device</p></div>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><span class="material-icons-round">lock</span></div>
@@ -829,23 +798,23 @@ _WELCOME_PAGE = """<!DOCTYPE html>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><span class="material-icons-round">timer</span></div>
-        <div><h3>Auto-Expiry</h3><p>Sessions self-destruct after your chosen duration</p></div>
+        <div><h3>Auto-Expiry</h3><p>Sessions self-destruct seamlessly after duration</p></div>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><span class="material-icons-round">devices</span></div>
-        <div><h3>Cross-Platform</h3><p>Works on any device with a browser — no app needed</p></div>
+        <div><h3>Cross-Platform</h3><p>Works anywhere with a modern web browser</p></div>
       </div>
       <div class="feature-card">
-        <div class="feature-icon"><span class="material-icons-round">file_copy</span></div>
-        <div><h3>Multi-Format</h3><p>Images, documents, videos, archives — anything</p></div>
+        <div class="feature-icon"><span class="material-icons-round">attach_file</span></div>
+        <div><h3>Any File</h3><p>Share documents, videos, images — any file type up to 1 GB</p></div>
       </div>
       <div class="feature-card">
-        <div class="feature-icon"><span class="material-icons-round">person_off</span></div>
-        <div><h3>No Login</h3><p>Zero accounts. Start sharing immediately</p></div>
+        <div class="feature-icon"><span class="material-icons-round">bolt</span></div>
+        <div><h3>Instant Sharing</h3><p>No sign-up required — upload and share in seconds</p></div>
       </div>
     </div>
   </main>
-  <footer class="footer">FILECP</footer>
+  <footer class="footer">FileCP &copy; 2026</footer>
 </body>
 </html>"""
 
@@ -856,49 +825,53 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dashboard — filecp</title>
+  <title>Dashboard — FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
     .page {
-      min-height: calc(100vh - 56px);
+      min-height: calc(100vh - 72px);
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       padding: 40px 24px;
+      position: relative;
     }
     .page-title {
-      font-size: 1rem; font-weight: 600; color: var(--text-muted);
-      letter-spacing: 2px; text-transform: uppercase; margin-bottom: 40px;
+      font-size: 1.1rem; font-weight: 700; color: var(--text-primary);
+      letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 48px;
     }
     .action-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-      max-width: 520px; width: 100%;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+      max-width: 600px; width: 100%;
     }
     @media (max-width: 500px) { .action-grid { grid-template-columns: 1fr; } }
     .action-card {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 16px; padding: 40px 24px;
-      background: var(--bg-surface); border: 1px solid var(--border-color);
+      gap: 20px; padding: 48px 24px;
+      background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color);
       border-radius: var(--radius-lg);
       cursor: pointer; transition: all var(--transition);
       text-decoration: none; color: var(--text-primary);
+      backdrop-filter: blur(12px);
     }
     .action-card:hover {
-      border-color: var(--border-light);
-      background: var(--bg-surface-hover);
-      transform: translateY(-3px);
+      border-color: rgba(255, 255, 255, 0.15);
+      background: rgba(255, 255, 255, 0.04);
+      transform: translateY(-6px);
+      box-shadow: var(--shadow-sm);
     }
     .action-icon {
-      width: 56px; height: 56px; border-radius: 50%;
-      background: var(--accent-subtle);
+      width: 64px; height: 64px; border-radius: 50%;
+      background: linear-gradient(135deg, rgba(0, 229, 255, 0.1), rgba(255, 0, 122, 0.1));
+      border: 1px solid rgba(0, 229, 255, 0.2);
       display: flex; align-items: center; justify-content: center;
     }
-    .action-icon .material-icons-round { font-size: 26px; color: var(--text-secondary); }
-    .action-card h2 { font-size: 0.95rem; font-weight: 700; letter-spacing: 1px; }
-    .action-card p { font-size: 0.7rem; color: var(--text-muted); text-align: center; line-height: 1.5; }
+    .action-icon .material-icons-round { font-size: 32px; color: var(--accent); }
+    .action-card h2 { font-family: var(--display-font); font-size: 1.3rem; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 4px; }
+    .action-card p { font-size: 0.85rem; color: var(--text-muted); text-align: center; line-height: 1.6; }
   </style>
 </head>
 <body>
   """ + _NAV_INNER + """
-  <main class="page">
+  <main class="page container">
     <div class="page-title animate-in">What would you like to do?</div>
     <div class="action-grid">
       <a href="/send" class="action-card animate-in stagger-1">
@@ -923,95 +896,102 @@ _SEND_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Send — filecp</title>
+  <title>Send — FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
-    .page { padding: 32px 0 64px; }
-    .page-header { margin-bottom: 28px; }
-    .page-header h1 { font-size: 1.4rem; font-weight: 800; letter-spacing: 1px; }
-    .page-header p { color: var(--text-muted); font-size: 0.8rem; margin-top: 4px; }
+    .page { padding: 40px 0 80px; }
+    .page-header { margin-bottom: 32px; text-align: center; }
+    .page-header h1 { font-size: 1.8rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 8px; }
+    .page-header p { color: var(--text-muted); font-size: 0.95rem; }
 
     .drop-zone {
-      border: 1px dashed var(--border-light);
+      border: 2px dashed rgba(255, 255, 255, 0.15);
       border-radius: var(--radius-lg);
-      padding: 44px 24px; text-align: center;
+      padding: 56px 24px; text-align: center;
       cursor: pointer; transition: all var(--transition);
+      background: rgba(255, 255, 255, 0.02);
+      backdrop-filter: blur(12px);
     }
     .drop-zone:hover, .drop-zone.drag-over {
-      border-color: var(--text-muted); background: var(--accent-subtle);
+      border-color: var(--accent); background: rgba(0, 229, 255, 0.05);
+      box-shadow: 0 0 24px rgba(0, 229, 255, 0.1);
     }
-    .drop-zone-icon { font-size: 40px; color: var(--text-muted); margin-bottom: 10px; }
-    .drop-zone h3 { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
-    .drop-zone p { font-size: 0.7rem; color: var(--text-muted); }
+    .drop-zone-icon { font-size: 48px; color: var(--accent); margin-bottom: 16px; opacity: 0.8; }
+    .drop-zone h3 { font-family: var(--display-font); font-size: 1.1rem; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; }
+    .drop-zone p { font-size: 0.85rem; color: var(--text-muted); }
     .drop-zone input { display: none; }
 
-    .file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+    .file-list { display: flex; flex-direction: column; gap: 8px; margin-top: 24px; }
     .file-item {
-      display: flex; align-items: center; gap: 10px;
-      padding: 10px 14px; border-radius: var(--radius-sm);
-      background: var(--bg-secondary); border: 1px solid var(--border-color);
-      animation: fadeInUp 0.3s ease forwards;
+      display: flex; align-items: center; gap: 16px;
+      padding: 16px 20px; border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color);
+      animation: fadeInUp 0.4s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+      backdrop-filter: blur(8px);
     }
     .file-item-icon {
-      width: 32px; height: 32px; border-radius: 6px;
-      background: var(--accent-subtle); color: var(--text-muted);
+      width: 40px; height: 40px; border-radius: 10px;
+      background: rgba(0, 229, 255, 0.1); color: var(--accent);
       display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      border: 1px solid rgba(0, 229, 255, 0.2);
     }
-    .file-item-icon .material-icons-round { font-size: 16px; }
+    .file-item-icon .material-icons-round { font-size: 20px; }
     .file-item-info { flex: 1; min-width: 0; }
-    .file-item-name { font-size: 0.8rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-item-size { font-size: 0.65rem; color: var(--text-muted); }
+    .file-item-name { font-size: 0.95rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+    .file-item-size { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
     .file-item-remove {
-      width: 24px; height: 24px; border-radius: 50%;
-      background: none; border: none; color: var(--text-muted);
+      width: 32px; height: 32px; border-radius: 50%;
+      background: rgba(255, 255, 255, 0.05); border: none; color: var(--text-secondary);
       cursor: pointer; display: flex; align-items: center; justify-content: center;
       transition: all var(--transition); flex-shrink: 0;
     }
-    .file-item-remove:hover { color: var(--text-primary); }
+    .file-item-remove:hover { color: var(--error); background: rgba(255, 82, 82, 0.1); transform: scale(1.1); }
 
     .options-row {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
-      margin-top: 18px;
+      display: grid; grid-template-columns: 1fr 2fr; gap: 24px;
+      margin-top: 24px;
     }
     @media (max-width: 640px) { .options-row { grid-template-columns: 1fr; } }
 
     .duration-input-row {
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 12px;
     }
     .duration-input {
-      width: 80px; padding: 12px 14px; border-radius: var(--radius-sm);
-      background: var(--bg-secondary); border: 1px solid var(--border-color);
-      color: var(--text-primary); font-family: var(--font); font-size: 0.95rem;
+      width: 90px; padding: 14px 16px; border-radius: var(--radius-md);
+      background: rgba(10, 10, 10, 0.8); border: 1px solid var(--border-color);
+      color: var(--text-primary); font-family: var(--font); font-size: 1.05rem; font-weight: 600;
       text-align: center; outline: none; transition: all var(--transition);
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
     }
-    .duration-input:focus { border-color: var(--text-muted); }
-    .duration-label { font-size: 0.8rem; color: var(--text-muted); }
+    .duration-input:focus { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(0, 229, 255, 0.1), inset 0 2px 4px rgba(0,0,0,0.2); }
+    .duration-label { font-size: 0.9rem; color: var(--text-muted); font-weight: 500; }
 
-    .upload-actions { margin-top: 22px; display: flex; gap: 12px; align-items: center; }
-    .upload-actions .file-count { font-size: 0.75rem; color: var(--text-muted); margin-left: auto; }
+    .upload-actions { margin-top: 32px; display: flex; gap: 16px; align-items: center; }
+    .upload-actions .file-count { font-size: 0.85rem; color: var(--text-muted); margin-left: auto; font-weight: 500; }
 
     .upload-progress {
-      margin-top: 22px; padding: 18px;
-      border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      display: none;
+      margin-top: 32px; padding: 24px;
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color);
+      display: none; backdrop-filter: blur(12px);
     }
-    .upload-progress.active { display: block; }
-    .upload-progress-text { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 8px; }
+    .upload-progress.active { display: block; animation: fadeInUp 0.4s forwards; }
+    .upload-progress-text { font-size: 0.9rem; font-weight: 600; color: var(--text-primary); margin-bottom: 12px; display: flex; justify-content: space-between; }
 
     /* QR-only result */
-    .result-section { margin-top: 32px; display: none; }
-    .result-section.active { display: block; animation: fadeInUp 0.5s ease forwards; }
+    .result-section { margin-top: 40px; display: none; }
+    .result-section.active { display: block; animation: fadeInUp 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards; }
     .result-card {
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      border-radius: var(--radius-lg); padding: 40px;
-      display: flex; flex-direction: column; align-items: center; gap: 20px;
-      text-align: center;
+      background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(0, 229, 255, 0.2);
+      border-radius: var(--radius-lg); padding: 48px;
+      display: flex; flex-direction: column; align-items: center; gap: 24px;
+      text-align: center; backdrop-filter: blur(16px);
+      box-shadow: 0 16px 48px rgba(0, 229, 255, 0.1);
     }
-    .result-card h2 { font-size: 0.9rem; font-weight: 700; color: var(--text-secondary); letter-spacing: 1px; }
+    .result-card h2 { font-family: var(--display-font); font-size: 1.4rem; font-weight: 800; color: var(--text-bright); letter-spacing: 0.05em; }
     .result-qr-img {
-      width: 220px; height: 220px; border-radius: var(--radius-md);
-      border: 1px solid var(--border-color);
+      width: 260px; height: 260px; border-radius: var(--radius-md);
+      border: 4px solid var(--border-color); padding: 8px; background: #fff;
     }
     .result-hint { font-size: 0.7rem; color: var(--text-muted); }
     .countdown-text { font-size: 0.75rem; color: var(--text-muted); font-weight: 600; }
@@ -1029,7 +1009,7 @@ _SEND_PAGE = """<!DOCTYPE html>
       <div class="drop-zone" id="dropZone">
         <span class="material-icons-round drop-zone-icon">cloud_upload</span>
         <h3>Drop files here or click to browse</h3>
-        <p>Any file type &middot; Up to 200 MB per file &middot; 500 MB total</p>
+        <p>Any file type &middot; Up to 1 GB per file &middot; 2 GB total</p>
         <input type="file" id="fileInput" multiple>
       </div>
 
@@ -1229,45 +1209,50 @@ _RECEIVE_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Receive — filecp</title>
+  <title>Receive — FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
     .page {
-      min-height: calc(100vh - 56px);
+      min-height: calc(100vh - 72px);
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       padding: 40px 24px;
     }
     .receive-card {
-      max-width: 420px; width: 100%; text-align: center;
+      max-width: 460px; width: 100%; text-align: center;
+      background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(16px); box-shadow: var(--shadow-lg);
     }
     .receive-card h2 {
-      font-size: 1.1rem; font-weight: 700; margin-bottom: 8px;
-      letter-spacing: 1px;
+      font-size: 1.4rem; font-weight: 800; margin-bottom: 12px;
+      letter-spacing: -0.02em; color: var(--text-bright);
     }
     .receive-card p {
-      font-size: 0.75rem; color: var(--text-muted); margin-bottom: 28px;
+      font-size: 0.9rem; color: var(--text-muted); margin-bottom: 32px;
       line-height: 1.6;
     }
     .qr-section {
-      display: none; flex-direction: column; align-items: center; gap: 20px;
-      animation: fadeInUp 0.5s ease forwards;
+      display: none; flex-direction: column; align-items: center; gap: 24px;
+      animation: fadeInUp 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards;
     }
     .qr-section.active { display: flex; }
     .qr-section img {
-      width: 240px; height: 240px; border-radius: var(--radius-lg);
-      border: 1px solid var(--border-color); background: rgba(255,255,255,0.92);
-      box-shadow: var(--shadow-md);
+      width: 260px; height: 260px; border-radius: var(--radius-lg);
+      border: 4px solid var(--border-color); padding: 8px; background: #fff;
+      box-shadow: 0 16px 48px rgba(0, 229, 255, 0.1);
     }
-    .qr-hint { font-size: 0.75rem; color: var(--text-muted); max-width: 300px; line-height: 1.6; }
+    .qr-hint { font-size: 0.85rem; color: var(--text-muted); max-width: 320px; line-height: 1.6; font-weight: 500; }
     .waiting-status {
-      display: flex; align-items: center; gap: 10px;
-      padding: 12px 20px; border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      font-size: 0.8rem; color: var(--text-secondary);
+      display: flex; align-items: center; gap: 12px;
+      padding: 16px 24px; border-radius: var(--radius-md);
+      background: rgba(0, 229, 255, 0.05); border: 1px solid rgba(0, 229, 255, 0.2);
+      font-size: 0.9rem; color: var(--accent); font-weight: 600;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
     }
     .session-code {
-      font-family: var(--display-font); font-size: 1.35rem;
-      font-weight: 700; letter-spacing: 0.18em; color: var(--accent);
+      font-family: var(--font); font-size: 1.6rem;
+      font-weight: 800; letter-spacing: 0.2em; color: var(--text-bright);
+      background: rgba(255, 255, 255, 0.05); padding: 8px 24px; border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
     }
   </style>
 </head>
@@ -1350,63 +1335,67 @@ _SEND_TO_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Send Files — filecp</title>
+  <title>Send Files — FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
-    .page { padding: 32px 0 64px; }
-    .page-header { margin-bottom: 28px; text-align: center; }
-    .page-header h1 { font-size: 1.4rem; font-weight: 800; letter-spacing: 1px; }
-    .page-header p { color: var(--text-muted); font-size: 0.8rem; margin-top: 4px; }
-    .page-header .code { color: var(--accent); font-family: var(--display-font); font-weight: 700; letter-spacing: 0.12em; }
+    .page { padding: 40px 0 80px; }
+    .page-header { margin-bottom: 32px; text-align: center; }
+    .page-header h1 { font-size: 1.8rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 8px; }
+    .page-header p { color: var(--text-muted); font-size: 0.95rem; }
+    .page-header .code { color: var(--accent); font-family: var(--font); font-weight: 700; letter-spacing: 0.12em; background: rgba(0, 229, 255, 0.1); padding: 4px 10px; border-radius: 6px; }
 
     .drop-zone {
-      border: 1px dashed var(--border-light); border-radius: var(--radius-lg);
-      padding: 44px 24px; text-align: center; cursor: pointer; transition: all var(--transition);
+      border: 2px dashed rgba(255, 255, 255, 0.15); border-radius: var(--radius-lg);
+      padding: 56px 24px; text-align: center; cursor: pointer; transition: all var(--transition);
+      background: rgba(255, 255, 255, 0.02); backdrop-filter: blur(12px);
     }
-    .drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: var(--accent-subtle); }
-    .drop-zone-icon { font-size: 40px; color: var(--text-muted); margin-bottom: 10px; }
-    .drop-zone h3 { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
-    .drop-zone p { font-size: 0.7rem; color: var(--text-muted); }
+    .drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: rgba(0, 229, 255, 0.05); box-shadow: 0 0 24px rgba(0, 229, 255, 0.1); }
+    .drop-zone-icon { font-size: 48px; color: var(--accent); margin-bottom: 16px; opacity: 0.8; }
+    .drop-zone h3 { font-family: var(--display-font); font-size: 1.1rem; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; }
+    .drop-zone p { font-size: 0.85rem; color: var(--text-muted); }
     .drop-zone input { display: none; }
 
-    .file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+    .file-list { display: flex; flex-direction: column; gap: 8px; margin-top: 24px; }
     .file-item {
-      display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-      border-radius: var(--radius-sm); background: var(--bg-secondary); border: 1px solid var(--border-color);
-      animation: fadeInUp 0.3s ease forwards;
+      display: flex; align-items: center; gap: 16px; padding: 16px 20px;
+      border-radius: var(--radius-md); background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color);
+      animation: fadeInUp 0.4s cubic-bezier(0.25, 1, 0.5, 1) forwards; backdrop-filter: blur(8px);
     }
     .file-item-icon {
-      width: 32px; height: 32px; border-radius: 6px; background: var(--accent-subtle); color: var(--text-muted);
-      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      width: 40px; height: 40px; border-radius: 10px; background: rgba(0, 229, 255, 0.1); color: var(--accent);
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid rgba(0, 229, 255, 0.2);
     }
-    .file-item-icon .material-icons-round { font-size: 16px; }
+    .file-item-icon .material-icons-round { font-size: 20px; }
     .file-item-info { flex: 1; min-width: 0; }
-    .file-item-name { font-size: 0.8rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-item-size { font-size: 0.65rem; color: var(--text-muted); }
+    .file-item-name { font-size: 0.95rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+    .file-item-size { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
     .file-item-remove {
-      width: 24px; height: 24px; border-radius: 50%; background: none; border: none;
-      color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px; border-radius: 50%; background: rgba(255, 255, 255, 0.05); border: none;
+      color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; justify-content: center;
+      transition: all var(--transition); flex-shrink: 0;
     }
-    .file-item-remove:hover { color: var(--text-primary); }
+    .file-item-remove:hover { color: var(--error); background: rgba(255, 82, 82, 0.1); transform: scale(1.1); }
 
-    .upload-actions { margin-top: 22px; display: flex; gap: 12px; align-items: center; }
-    .upload-actions .file-count { font-size: 0.75rem; color: var(--text-muted); margin-left: auto; }
+    .upload-actions { margin-top: 32px; display: flex; gap: 16px; align-items: center; }
+    .upload-actions .file-count { font-size: 0.85rem; color: var(--text-muted); margin-left: auto; font-weight: 500; }
 
     .upload-progress {
-      margin-top: 22px; padding: 18px; border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color); display: none;
+      margin-top: 32px; padding: 24px; border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); display: none; backdrop-filter: blur(12px);
     }
-    .upload-progress.active { display: block; }
-    .upload-progress-text { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 8px; }
+    .upload-progress.active { display: block; animation: fadeInUp 0.4s forwards; }
+    .upload-progress-text { font-size: 0.9rem; font-weight: 600; color: var(--text-primary); margin-bottom: 12px; display: flex; justify-content: space-between; }
 
-    .success-section { margin-top: 32px; display: none; text-align: center; }
-    .success-section.active { display: block; animation: fadeInUp 0.5s ease forwards; }
+    .success-section { margin-top: 40px; display: none; text-align: center; }
+    .success-section.active { display: block; animation: fadeInUp 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards; }
     .success-card {
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      border-radius: var(--radius-lg); padding: 40px;
-      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(105, 240, 174, 0.3);
+      border-radius: var(--radius-lg); padding: 48px;
+      display: flex; flex-direction: column; align-items: center; gap: 16px;
+      backdrop-filter: blur(16px); box-shadow: 0 16px 48px rgba(105, 240, 174, 0.1);
     }
-    .success-icon { font-size: 48px; color: var(--accent); }
+    .success-icon { font-size: 64px; color: var(--success); }
+    .success-card h2 { font-family: var(--display-font); font-size: 1.4rem; font-weight: 800; color: var(--text-bright); }
   </style>
 </head>
 <body>
@@ -1421,7 +1410,7 @@ _SEND_TO_PAGE = """<!DOCTYPE html>
       <div class="drop-zone" id="dropZone">
         <span class="material-icons-round drop-zone-icon">cloud_upload</span>
         <h3>Drop files here or click to browse</h3>
-        <p>Any file type &middot; Up to 200 MB per file &middot; 500 MB total</p>
+        <p>Any file type &middot; Up to 1 GB per file &middot; 2 GB total</p>
         <input type="file" id="fileInput" multiple>
       </div>
 
@@ -1560,84 +1549,86 @@ _SESSION_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Session — filecp</title>
+  <title>Session — FileCP: Self File Sharing Application</title>
   """ + _SHARED_STYLES + """
   <style>
-    .page { padding: 32px 0 64px; }
+    .page { padding: 40px 0 80px; }
 
     .loading-state {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      min-height: 50vh; gap: 16px;
+      min-height: 60vh; gap: 24px;
     }
-    .loading-state p { color: var(--text-muted); font-size: 0.85rem; }
+    .loading-state p { color: var(--text-muted); font-size: 1rem; font-weight: 500; }
 
     .error-state {
       display: none; flex-direction: column; align-items: center; justify-content: center;
-      min-height: 50vh; gap: 14px; text-align: center;
+      min-height: 60vh; gap: 16px; text-align: center;
     }
-    .error-state.active { display: flex; }
-    .error-state h2 { font-size: 1.1rem; font-weight: 700; }
-    .error-state p { color: var(--text-muted); font-size: 0.8rem; max-width: 360px; }
+    .error-state.active { display: flex; animation: fadeInUp 0.5s ease forwards; }
+    .error-state h2 { font-family: var(--display-font); font-size: 1.4rem; font-weight: 800; }
+    .error-state p { color: var(--text-muted); font-size: 0.95rem; max-width: 400px; line-height: 1.6; }
 
     .session-content { display: none; }
-    .session-content.active { display: block; animation: fadeInUp 0.5s ease forwards; }
+    .session-content.active { display: block; animation: fadeInUp 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards; }
 
     .session-header {
       display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 20px; flex-wrap: wrap; gap: 10px;
+      margin-bottom: 32px; flex-wrap: wrap; gap: 16px;
     }
-    .session-header h1 { font-size: 1.2rem; font-weight: 800; letter-spacing: 1px; }
+    .session-header h1 { font-family: var(--display-font); font-size: 1.6rem; font-weight: 800; letter-spacing: -0.02em; }
 
     .note-box {
-      padding: 14px 18px; border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      margin-bottom: 18px; display: flex; align-items: flex-start; gap: 10px;
+      padding: 16px 24px; border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.08);
+      margin-bottom: 24px; display: flex; align-items: flex-start; gap: 12px;
+      backdrop-filter: blur(12px); box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
     }
-    .note-box .material-icons-round { color: var(--text-muted); font-size: 18px; margin-top: 2px; flex-shrink: 0; }
-    .note-box p { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.6; word-break: break-word; }
+    .note-box .material-icons-round { color: var(--accent); font-size: 20px; margin-top: 2px; flex-shrink: 0; }
+    .note-box p { font-size: 0.9rem; color: var(--text-primary); line-height: 1.6; word-break: break-word; }
 
     .files-grid {
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-      gap: 10px; margin-bottom: 20px;
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px; margin-bottom: 32px;
     }
     .file-card {
-      display: flex; align-items: center; gap: 12px;
-      padding: 14px; border-radius: var(--radius-md);
-      background: var(--bg-surface); border: 1px solid var(--border-color);
-      transition: all var(--transition); cursor: pointer;
+      display: flex; align-items: center; gap: 16px;
+      padding: 16px 20px; border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color);
+      transition: all var(--transition); cursor: pointer; backdrop-filter: blur(8px);
     }
     .file-card:hover {
-      border-color: var(--border-light); background: var(--bg-surface-hover);
+      border-color: rgba(0, 229, 255, 0.3); background: rgba(0, 229, 255, 0.05);
+      transform: translateY(-4px); box-shadow: var(--shadow-sm);
     }
     .file-card-icon {
-      width: 38px; height: 38px; border-radius: 8px;
-      background: var(--accent-subtle); color: var(--text-muted);
+      width: 44px; height: 44px; border-radius: 10px;
+      background: rgba(0, 229, 255, 0.1); color: var(--accent); border: 1px solid rgba(0, 229, 255, 0.2);
       display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     }
-    .file-card-icon .material-icons-round { font-size: 18px; }
+    .file-card-icon .material-icons-round { font-size: 22px; }
     .file-card-info { flex: 1; min-width: 0; }
-    .file-card-name { font-size: 0.8rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-card-size { font-size: 0.65rem; color: var(--text-muted); margin-top: 2px; }
+    .file-card-name { font-size: 0.95rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+    .file-card-size { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
     .file-card-dl {
-      width: 32px; height: 32px; border-radius: 50%;
-      background: var(--accent-subtle); color: var(--text-secondary);
+      width: 36px; height: 36px; border-radius: 50%;
+      background: rgba(255, 255, 255, 0.05); color: var(--text-secondary);
       display: flex; align-items: center; justify-content: center;
       border: none; cursor: pointer; transition: all var(--transition); flex-shrink: 0;
     }
-    .file-card-dl:hover { background: var(--text-secondary); color: var(--bg-primary); }
+    .file-card-dl:hover { background: var(--accent); color: #000; box-shadow: 0 4px 12px rgba(0, 229, 255, 0.3); transform: scale(1.1); }
 
     .image-preview {
-      border-radius: var(--radius-sm); max-width: 100%; max-height: 180px;
-      object-fit: cover; margin-top: 8px; cursor: pointer;
+      border-radius: var(--radius-sm); max-width: 100%; max-height: 200px;
+      object-fit: cover; margin-top: 12px; cursor: pointer; border: 1px solid var(--border-color);
     }
 
     .modal-overlay {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.9);
+      position: fixed; inset: 0; background: rgba(0,0,0,0.95);
       z-index: 1000; display: none; align-items: center; justify-content: center;
-      padding: 24px; cursor: pointer;
+      padding: 32px; cursor: pointer; backdrop-filter: blur(8px);
     }
-    .modal-overlay.active { display: flex; animation: fadeIn 0.2s ease; }
-    .modal-overlay img { max-width: 90vw; max-height: 90vh; border-radius: var(--radius-md); object-fit: contain; }
+    .modal-overlay.active { display: flex; animation: fadeIn 0.3s ease; }
+    .modal-overlay img { max-width: 90vw; max-height: 90vh; border-radius: var(--radius-lg); object-fit: contain; box-shadow: 0 24px 64px rgba(0,0,0,0.5); }
   </style>
 </head>
 <body>
